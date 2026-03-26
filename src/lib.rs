@@ -47,8 +47,11 @@ pub enum Error {
     #[error("failed to connect to aria2c after {0:?}")]
     ConnectTimeout(Duration),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(&'static str),
+
     #[error("aria2 rpc: {0}")]
-    Rpc(#[from] aria2_rs::Error),
+    Rpc(Box<aria2_rs::Error>),
 
     #[error("process not running")]
     NotRunning,
@@ -58,6 +61,12 @@ pub enum Error {
 
     #[error("progress channel closed")]
     ChannelClosed,
+}
+
+impl From<aria2_rs::Error> for Error {
+    fn from(value: aria2_rs::Error) -> Self {
+        Self::Rpc(Box::new(value))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -98,7 +107,8 @@ impl DownloadProgress {
         if self.total_length == 0 {
             0.0
         } else {
-            self.completed_length as f64 / self.total_length as f64 * 100.0
+            let completed = self.completed_length.min(self.total_length);
+            completed as f64 / self.total_length as f64 * 100.0
         }
     }
 
@@ -343,6 +353,13 @@ impl Aria2Downloader {
         urls: Vec<String>,
         opts: Option<DownloadOptions>,
     ) -> Result<DownloadHandle> {
+        if urls.is_empty() {
+            return Err(Error::InvalidInput("at least one URI is required"));
+        }
+        if urls.iter().any(|url| url.trim().is_empty()) {
+            return Err(Error::InvalidInput("download URI must not be empty"));
+        }
+
         self.ensure_running().await?;
         self.shared.activity.notify_one();
 
@@ -668,6 +685,349 @@ fn into_task_options(opts: DownloadOptions) -> TaskOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+
+    static NEXT_RPC_PORT: AtomicUsize = AtomicUsize::new(38_080);
+    static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(1);
+
+    #[derive(Clone)]
+    struct HttpResponse {
+        status_code: u16,
+        reason: &'static str,
+        body: Vec<u8>,
+        extra_headers: Vec<(String, String)>,
+        chunk_size: usize,
+        chunk_delay: Duration,
+    }
+
+    impl HttpResponse {
+        fn ok(body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status_code: 200,
+                reason: "OK",
+                body: body.into(),
+                extra_headers: Vec::new(),
+                chunk_size: usize::MAX,
+                chunk_delay: Duration::from_millis(0),
+            }
+        }
+
+        fn slow_ok(body: impl Into<Vec<u8>>, chunk_size: usize, chunk_delay: Duration) -> Self {
+            Self {
+                chunk_size,
+                chunk_delay,
+                ..Self::ok(body)
+            }
+        }
+
+        fn not_found() -> Self {
+            Self {
+                status_code: 404,
+                reason: "Not Found",
+                body: b"not found".to_vec(),
+                extra_headers: Vec::new(),
+                chunk_size: usize::MAX,
+                chunk_delay: Duration::from_millis(0),
+            }
+        }
+    }
+
+    struct TestHttpServer {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestHttpServer {
+        fn start(routes: Vec<(String, HttpResponse)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            listener
+                .set_nonblocking(true)
+                .expect("configure test server");
+            let addr = listener.local_addr().expect("server address");
+            let routes = Arc::new(routes.into_iter().collect::<HashMap<_, _>>());
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let stop_flag = stop.clone();
+            let routes_ref = routes.clone();
+            let thread = thread::spawn(move || serve_http(listener, routes_ref, stop_flag));
+
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{}", self.addr, path)
+        }
+    }
+
+    impl Drop for TestHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let name = format!(
+                "aria2-downloader-test-{}-{}",
+                std::process::id(),
+                NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(name);
+            fs::create_dir_all(&path).expect("create temp test dir");
+            Self { path }
+        }
+
+        fn path_string(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn serve_http(
+        listener: TcpListener,
+        routes: Arc<HashMap<String, HttpResponse>>,
+        stop: Arc<AtomicBool>,
+    ) {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let _ = handle_connection(&mut stream, &routes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn handle_connection(
+        stream: &mut TcpStream,
+        routes: &HashMap<String, HttpResponse>,
+    ) -> std::io::Result<()> {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if request.is_empty() {
+            return Ok(());
+        }
+
+        let request = String::from_utf8_lossy(&request);
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or("/");
+        let path = target.split('?').next().unwrap_or(target);
+
+        let mut range = None;
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Range: bytes=") {
+                range = parse_range_header(value);
+            }
+        }
+
+        let response = routes
+            .get(path)
+            .cloned()
+            .unwrap_or_else(HttpResponse::not_found);
+        write_response(stream, method, &response, range)
+    }
+
+    fn parse_range_header(value: &str) -> Option<(usize, Option<usize>)> {
+        let (start, end) = value.split_once('-')?;
+        let start = start.parse().ok()?;
+        let end = if end.is_empty() {
+            None
+        } else {
+            Some(end.parse().ok()?)
+        };
+        Some((start, end))
+    }
+
+    fn write_response(
+        stream: &mut TcpStream,
+        method: &str,
+        response: &HttpResponse,
+        range: Option<(usize, Option<usize>)>,
+    ) -> std::io::Result<()> {
+        let mut status_code = response.status_code;
+        let mut reason = response.reason;
+        let mut content_range = None;
+        let mut body = response.body.as_slice();
+
+        if response.status_code == 200
+            && let Some((start, end)) = range
+            && start < response.body.len()
+        {
+            let end = end
+                .map(|end| end.saturating_add(1).min(response.body.len()))
+                .unwrap_or(response.body.len());
+            if start < end {
+                status_code = 206;
+                reason = "Partial Content";
+                body = &response.body[start..end];
+                content_range = Some(format!(
+                    "bytes {}-{}/{}",
+                    start,
+                    end - 1,
+                    response.body.len()
+                ));
+            }
+        }
+
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\nAccept-Ranges: bytes\r\n",
+            status_code,
+            reason,
+            body.len()
+        )?;
+        if let Some(content_range) = content_range {
+            write!(stream, "Content-Range: {content_range}\r\n")?;
+        }
+        for (name, value) in &response.extra_headers {
+            write!(stream, "{name}: {value}\r\n")?;
+        }
+        write!(stream, "\r\n")?;
+
+        if method.eq_ignore_ascii_case("HEAD") {
+            stream.flush()?;
+            return Ok(());
+        }
+
+        let chunk_size = response.chunk_size.max(1);
+        for chunk in body.chunks(chunk_size) {
+            if let Err(error) = stream.write_all(chunk) {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            stream.flush()?;
+            if !response.chunk_delay.is_zero() {
+                thread::sleep(response.chunk_delay);
+            }
+        }
+        Ok(())
+    }
+
+    fn test_downloader(idle_timeout: Duration) -> Aria2Downloader {
+        Aria2Downloader::builder(std::env::var("ARIA2C_BIN").unwrap_or_else(|_| "aria2c".into()))
+            .rpc_port(NEXT_RPC_PORT.fetch_add(1, Ordering::Relaxed) as u16)
+            .idle_timeout(idle_timeout)
+            .poll_interval(Duration::from_millis(50))
+            .build()
+    }
+
+    fn download_options(dir: &TestDir, out: &str) -> DownloadOptions {
+        DownloadOptions {
+            dir: Some(dir.path_string()),
+            out: Some(out.to_string()),
+            split: Some(1),
+            max_connection_per_server: Some(1),
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_download(handle: DownloadHandle) -> Result<DownloadProgress> {
+        tokio::time::timeout(Duration::from_secs(15), handle.wait())
+            .await
+            .expect("download timed out")
+    }
+
+    async fn wait_for_active(handle: &mut DownloadHandle) -> DownloadProgress {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let progress = handle.progress();
+                if matches!(
+                    progress.status,
+                    DownloadStatus::Active | DownloadStatus::Waiting
+                ) {
+                    return progress;
+                }
+                assert!(
+                    !progress.is_finished(),
+                    "download finished before it became active: {progress:?}"
+                );
+                handle.changed().await.expect("progress update");
+            }
+        })
+        .await
+        .expect("download never became active")
+    }
+
+    async fn wait_for_idle_shutdown(dl: &Aria2Downloader) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !dl.is_running().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("aria2c did not stop after idle timeout");
+    }
 
     #[test]
     fn status_to_progress_maps_expected_fields() {
@@ -720,6 +1080,281 @@ mod tests {
             Error::DownloadFailed { gid, message } => {
                 assert_eq!(gid, "gid-2");
                 assert_eq!(message, "boom");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn percent_is_clamped_to_hundred() {
+        let progress = DownloadProgress {
+            total_length: 10,
+            completed_length: 15,
+            ..Default::default()
+        };
+
+        assert_eq!(progress.percent(), 100.0);
+    }
+
+    #[test]
+    fn into_task_options_maps_values_and_skips_empty_headers() {
+        let empty_headers = into_task_options(DownloadOptions::default());
+        assert!(empty_headers.header.is_none());
+
+        let task_options = into_task_options(DownloadOptions {
+            dir: Some("downloads".into()),
+            out: Some("file.bin".into()),
+            headers: vec!["Referer: http://localhost".into()],
+            split: Some(4),
+            max_connection_per_server: Some(2),
+            proxy: Some("http://127.0.0.1:8080".into()),
+        });
+
+        assert_eq!(
+            task_options.dir.as_ref().map(|s| s.as_str()),
+            Some("downloads")
+        );
+        assert_eq!(
+            task_options.out.as_ref().map(|s| s.as_str()),
+            Some("file.bin")
+        );
+        assert_eq!(task_options.split, Some(4));
+        assert_eq!(task_options.max_connection_per_server, Some(2));
+        assert_eq!(
+            task_options.all_proxy.as_ref().map(|s| s.as_str()),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            task_options
+                .header
+                .as_ref()
+                .map(|headers| headers.iter().map(|h| h.as_str()).collect::<Vec<_>>()),
+            Some(vec!["Referer: http://localhost"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_uris_rejects_empty_and_blank_inputs() {
+        let dl = test_downloader(Duration::from_secs(1));
+
+        let err = match dl.download_uris(Vec::new(), None).await {
+            Ok(_) => panic!("empty URI list should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::InvalidInput("at least one URI is required")
+        ));
+        assert!(!dl.is_running().await);
+
+        let err = match dl.download_uris(vec!["  ".to_string()], None).await {
+            Ok(_) => panic!("blank URI should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::InvalidInput("download URI must not be empty")
+        ));
+        assert!(!dl.is_running().await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_completes_idles_and_restarts() {
+        let server = TestHttpServer::start(vec![
+            (
+                "/first.bin".into(),
+                HttpResponse::ok(b"first payload".to_vec()),
+            ),
+            (
+                "/second.bin".into(),
+                HttpResponse::ok(b"second payload".to_vec()),
+            ),
+        ]);
+        let dir = TestDir::new();
+        let dl = test_downloader(Duration::from_millis(250));
+
+        assert!(!dl.is_running().await);
+
+        let first = dl
+            .download(
+                &server.url("/first.bin"),
+                Some(download_options(&dir, "first.bin")),
+            )
+            .await
+            .expect("start first download");
+        assert!(dl.is_running().await);
+
+        let first_progress = wait_for_download(first)
+            .await
+            .expect("first download succeeds");
+        assert_eq!(first_progress.status, DownloadStatus::Complete);
+        assert_eq!(
+            fs::read(dir.file("first.bin")).expect("read first file"),
+            b"first payload"
+        );
+
+        wait_for_idle_shutdown(&dl).await;
+        assert!(!dl.is_running().await);
+
+        let second = dl
+            .download(
+                &server.url("/second.bin"),
+                Some(download_options(&dir, "second.bin")),
+            )
+            .await
+            .expect("start second download");
+        assert!(dl.is_running().await);
+
+        let second_progress = wait_for_download(second)
+            .await
+            .expect("second download succeeds");
+        assert_eq!(second_progress.status, DownloadStatus::Complete);
+        assert_eq!(
+            fs::read(dir.file("second.bin")).expect("read second file"),
+            b"second payload"
+        );
+
+        dl.shutdown().await.expect("shutdown downloader");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_uris_can_fallback_to_second_mirror() {
+        let server = TestHttpServer::start(vec![
+            ("/missing.bin".into(), HttpResponse::not_found()),
+            (
+                "/mirror.bin".into(),
+                HttpResponse::ok(b"mirror payload".to_vec()),
+            ),
+        ]);
+        let dir = TestDir::new();
+        let dl = test_downloader(Duration::from_secs(1));
+
+        let handle = dl
+            .download_uris(
+                vec![server.url("/missing.bin"), server.url("/mirror.bin")],
+                Some(download_options(&dir, "mirror.bin")),
+            )
+            .await
+            .expect("submit mirrored download");
+
+        let progress = wait_for_download(handle)
+            .await
+            .expect("mirror fallback succeeds");
+        assert_eq!(progress.status, DownloadStatus::Complete);
+        assert_eq!(
+            fs::read(dir.file("mirror.bin")).expect("read mirrored file"),
+            b"mirror payload"
+        );
+
+        dl.shutdown().await.expect("shutdown downloader");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_binary_returns_process_start_error() {
+        let missing_binary = format!(
+            "aria2c-missing-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let dl = Aria2Downloader::builder(missing_binary)
+            .rpc_port(NEXT_RPC_PORT.fetch_add(1, Ordering::Relaxed) as u16)
+            .idle_timeout(Duration::from_secs(1))
+            .poll_interval(Duration::from_millis(50))
+            .build();
+
+        let err = match dl.download("http://127.0.0.1:1/unreachable", None).await {
+            Ok(_) => panic!("missing binary should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::ProcessStart(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_error_surfaces_as_download_failed() {
+        let server =
+            TestHttpServer::start(vec![("/missing.bin".into(), HttpResponse::not_found())]);
+        let dir = TestDir::new();
+        let dl = test_downloader(Duration::from_secs(1));
+
+        let handle = dl
+            .download(
+                &server.url("/missing.bin"),
+                Some(download_options(&dir, "missing.bin")),
+            )
+            .await
+            .expect("submit failing download");
+
+        let error = wait_for_download(handle)
+            .await
+            .expect_err("404 download should fail");
+
+        match error {
+            Error::DownloadFailed { gid, message } => {
+                assert!(!gid.is_empty());
+                assert!(!message.trim().is_empty());
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        dl.shutdown().await.expect("shutdown downloader");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_download_finishes_as_removed() {
+        let server = TestHttpServer::start(vec![(
+            "/slow.bin".into(),
+            HttpResponse::slow_ok(vec![b'x'; 512 * 1024], 16 * 1024, Duration::from_millis(30)),
+        )]);
+        let dir = TestDir::new();
+        let dl = test_downloader(Duration::from_secs(1));
+
+        let mut handle = dl
+            .download(
+                &server.url("/slow.bin"),
+                Some(download_options(&dir, "slow.bin")),
+            )
+            .await
+            .expect("submit slow download");
+
+        wait_for_active(&mut handle).await;
+        handle.cancel().await.expect("cancel slow download");
+
+        let progress = wait_for_download(handle)
+            .await
+            .expect("cancelled download should resolve with removed status");
+        assert_eq!(progress.status, DownloadStatus::Removed);
+
+        dl.shutdown().await.expect("shutdown downloader");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_marks_inflight_download_as_failed() {
+        let server = TestHttpServer::start(vec![(
+            "/slow.bin".into(),
+            HttpResponse::slow_ok(vec![b'y'; 512 * 1024], 16 * 1024, Duration::from_millis(30)),
+        )]);
+        let dir = TestDir::new();
+        let dl = test_downloader(Duration::from_secs(5));
+
+        let mut handle = dl
+            .download(
+                &server.url("/slow.bin"),
+                Some(download_options(&dir, "slow.bin")),
+            )
+            .await
+            .expect("submit slow download");
+
+        wait_for_active(&mut handle).await;
+        dl.shutdown().await.expect("shutdown running downloader");
+        assert!(!dl.is_running().await);
+
+        let error = wait_for_download(handle)
+            .await
+            .expect_err("shutdown should fail inflight download");
+
+        match error {
+            Error::DownloadFailed { message, .. } => {
+                assert!(message.contains("stopped"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
