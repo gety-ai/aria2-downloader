@@ -9,3 +9,4 @@ tokio = { version = "1", features = ["process", "sync", "time", "rt", "macros"] 
 thiserror = "2"
 tracing = "0.1"
 smallvec = "1"
+port-selector = "0.1"

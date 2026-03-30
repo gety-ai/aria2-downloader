@@ -22,6 +22,7 @@ name = "aria2-downloader"
 version = "0.1.0"
 dependencies = [
  "aria2-rs",
+ "port-selector",
  "smallvec",
  "thiserror",
  "tokio",
@@ -687,6 +688,15 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "port-selector"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0f0d4202cea786c2aa44e20692eb5dfac74f0d3804d2ce68fdbd40bedcbef05"
+dependencies = [
+ "rand 0.10.0",
+]
 
 [[package]]
 name = "powerfmt"

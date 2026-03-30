@@ -47,6 +47,12 @@ pub enum Error {
     #[error("failed to connect to aria2c after {0:?}")]
     ConnectTimeout(Duration),
 
+    #[error("RPC port {0} is already in use")]
+    PortInUse(u16),
+
+    #[error("no free port available")]
+    NoFreePort,
+
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
 
@@ -70,6 +76,19 @@ impl From<aria2_rs::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ── Port strategy ───────────────────────────────────────────
+
+/// Strategy for selecting the aria2 RPC listen port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortStrategy {
+    /// Use this exact port; fail with [`Error::PortInUse`] if occupied.
+    Fixed(u16),
+    /// Try the given port first; if occupied, pick a random free port.
+    AllowFallback(u16),
+    /// Always pick a random free port.
+    Random,
+}
 
 // ── Progress types ───────────────────────────────────────────
 
@@ -224,7 +243,7 @@ fn finish_result(p: DownloadProgress) -> Result<DownloadProgress> {
 struct Shared {
     aria2_path: PathBuf,
     idle_timeout: Duration,
-    rpc_port: u16,
+    port_strategy: PortStrategy,
     poll_interval: Duration,
     extra_args: Vec<String>,
 
@@ -264,7 +283,7 @@ impl Shared {
 pub struct Aria2DownloaderBuilder {
     aria2_path: PathBuf,
     idle_timeout: Duration,
-    rpc_port: u16,
+    port_strategy: PortStrategy,
     poll_interval: Duration,
     extra_args: Vec<String>,
 }
@@ -276,7 +295,12 @@ impl Aria2DownloaderBuilder {
     }
 
     pub fn rpc_port(mut self, port: u16) -> Self {
-        self.rpc_port = port;
+        self.port_strategy = PortStrategy::Fixed(port);
+        self
+    }
+
+    pub fn port_strategy(mut self, strategy: PortStrategy) -> Self {
+        self.port_strategy = strategy;
         self
     }
 
@@ -296,7 +320,7 @@ impl Aria2DownloaderBuilder {
             shared: Arc::new(Shared {
                 aria2_path: self.aria2_path,
                 idle_timeout: self.idle_timeout,
-                rpc_port: self.rpc_port,
+                port_strategy: self.port_strategy,
                 poll_interval: self.poll_interval,
                 extra_args: self.extra_args,
                 process: Mutex::new(None),
@@ -332,7 +356,7 @@ impl Aria2Downloader {
         Aria2DownloaderBuilder {
             aria2_path: aria2_path.into(),
             idle_timeout: Duration::from_secs(300),
-            rpc_port: 6800,
+            port_strategy: PortStrategy::Fixed(6800),
             poll_interval: Duration::from_secs(1),
             extra_args: Vec::new(),
         }
@@ -433,11 +457,13 @@ impl Aria2Downloader {
                 .as_nanos()
         );
 
+        let port = resolve_port(self.shared.port_strategy)?;
+
         let mut cmd = tokio::process::Command::new(&self.shared.aria2_path);
         cmd.args([
             "--enable-rpc",
-            &format!("--rpc-listen-port={}", self.shared.rpc_port),
-            &format!("--rpc-secret={}", secret),
+            &format!("--rpc-listen-port={port}"),
+            &format!("--rpc-secret={secret}"),
             "--rpc-listen-all=false",
             "--quiet",
         ]);
@@ -454,7 +480,7 @@ impl Aria2Downloader {
 
         let child = cmd.spawn().map_err(Error::ProcessStart)?;
         let client =
-            connect_with_retry(self.shared.rpc_port, &secret, Duration::from_secs(10)).await?;
+            connect_with_retry(port, &secret, Duration::from_secs(10)).await?;
         let client = Arc::new(client);
         self.shared
             .active_generation
@@ -468,7 +494,7 @@ impl Aria2Downloader {
 
         *guard = Some(ProcessCtx { child, client });
 
-        tracing::info!(port = self.shared.rpc_port, "aria2c started");
+        tracing::info!(port, "aria2c started");
         Ok(())
     }
 }
@@ -594,6 +620,26 @@ async fn run_idle_watcher(shared: Arc<Shared>, generation: u64) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────
+
+fn resolve_port(strategy: PortStrategy) -> Result<u16> {
+    match strategy {
+        PortStrategy::Fixed(port) => {
+            if !port_selector::is_free_tcp(port) {
+                return Err(Error::PortInUse(port));
+            }
+            Ok(port)
+        }
+        PortStrategy::AllowFallback(port) => {
+            if port_selector::is_free_tcp(port) {
+                Ok(port)
+            } else {
+                tracing::warn!(port, "preferred RPC port is in use, picking a free port");
+                port_selector::random_free_tcp_port().ok_or(Error::NoFreePort)
+            }
+        }
+        PortStrategy::Random => port_selector::random_free_tcp_port().ok_or(Error::NoFreePort),
+    }
+}
 
 async fn connect_with_retry(port: u16, secret: &str, timeout: Duration) -> Result<Client> {
     let deadline = Instant::now() + timeout;
