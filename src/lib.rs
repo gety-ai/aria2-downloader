@@ -96,6 +96,9 @@ pub enum PortStrategy {
 pub enum DownloadStatus {
     /// Submitted but not yet reported by aria2.
     Pending,
+    /// Active but no connection established yet
+    /// (heuristic: aria2 reports `active` with `connections == 0`).
+    Connecting,
     Active,
     Waiting,
     Paused,
@@ -542,6 +545,7 @@ async fn run_poller(shared: Arc<Shared>, generation: u64) {
                         StatusKey::DownloadSpeed,
                         StatusKey::UploadSpeed,
                         StatusKey::ErrorMessage,
+                        StatusKey::Connections,
                     ]),
                 })
                 .await;
@@ -694,7 +698,13 @@ fn status_to_progress(gid: &str, st: &Status) -> DownloadProgress {
     DownloadProgress {
         gid: gid.to_string(),
         status: match st.status {
-            Some(Aria2Status::Active) => DownloadStatus::Active,
+            Some(Aria2Status::Active) => {
+                if st.connections == Some(0) {
+                    DownloadStatus::Connecting
+                } else {
+                    DownloadStatus::Active
+                }
+            }
             Some(Aria2Status::Waiting) => DownloadStatus::Waiting,
             Some(Aria2Status::Paused) => DownloadStatus::Paused,
             Some(Aria2Status::Complete) => DownloadStatus::Complete,
@@ -1110,6 +1120,52 @@ mod tests {
         assert_eq!(progress.download_speed, 4);
         assert_eq!(progress.upload_speed, 2);
         assert_eq!(progress.percent(), 25.0);
+    }
+
+    #[test]
+    fn status_to_progress_maps_connecting_heuristic() {
+        let base = Status {
+            gid: Some("gid-1".into()),
+            status: Some(Aria2Status::Active),
+            total_length: Some(100),
+            completed_length: Some(0),
+            upload_length: None,
+            bitfield: None,
+            download_speed: Some(0),
+            upload_speed: Some(0),
+            info_hash: None,
+            num_seeders: None,
+            seeder: None,
+            piece_length: None,
+            num_pieces: None,
+            connections: None,
+            error_code: None,
+            error_message: None,
+            followed_by: None,
+            following: None,
+            belongs_to: None,
+            dir: None,
+            files: None,
+            bittorrent: None,
+        };
+
+        let connecting = Status {
+            connections: Some(0),
+            ..base.clone()
+        };
+        assert_eq!(
+            status_to_progress("gid-1", &connecting).status,
+            DownloadStatus::Connecting
+        );
+
+        let active = Status {
+            connections: Some(2),
+            ..base
+        };
+        assert_eq!(
+            status_to_progress("gid-1", &active).status,
+            DownloadStatus::Active
+        );
     }
 
     #[test]
