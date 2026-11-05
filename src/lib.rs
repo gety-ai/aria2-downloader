@@ -628,21 +628,33 @@ async fn run_idle_watcher(shared: Arc<Shared>, generation: u64) {
 fn resolve_port(strategy: PortStrategy) -> Result<u16> {
     match strategy {
         PortStrategy::Fixed(port) => {
-            if !port_selector::is_free_tcp(port) {
+            if !is_free_loopback_port(port) {
                 return Err(Error::PortInUse(port));
             }
             Ok(port)
         }
         PortStrategy::AllowFallback(port) => {
-            if port_selector::is_free_tcp(port) {
+            if is_free_loopback_port(port) {
                 Ok(port)
             } else {
                 tracing::warn!(port, "preferred RPC port is in use, picking a free port");
-                port_selector::random_free_tcp_port().ok_or(Error::NoFreePort)
+                random_free_loopback_port().ok_or(Error::NoFreePort)
             }
         }
-        PortStrategy::Random => port_selector::random_free_tcp_port().ok_or(Error::NoFreePort),
+        PortStrategy::Random => random_free_loopback_port().ok_or(Error::NoFreePort),
     }
+}
+
+// Port probes bind 127.0.0.1 only, the address aria2c listens on with
+// `--rpc-listen-all=false` and the client connects to. Probing the wildcard
+// address instead makes Windows Firewall prompt for the host executable.
+fn is_free_loopback_port(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+fn random_free_loopback_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+    Some(listener.local_addr().ok()?.port())
 }
 
 async fn connect_with_retry(port: u16, secret: &str, timeout: Duration) -> Result<Client> {
@@ -1185,6 +1197,27 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_port_random_picks_a_bindable_loopback_port() {
+        let port = resolve_port(PortStrategy::Random).unwrap();
+        assert_ne!(port, 0);
+        TcpListener::bind(("127.0.0.1", port)).expect("picked port should be free on loopback");
+    }
+
+    #[test]
+    fn resolve_port_detects_loopback_listener() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        assert!(matches!(
+            resolve_port(PortStrategy::Fixed(port)),
+            Err(Error::PortInUse(p)) if p == port
+        ));
+
+        let fallback = resolve_port(PortStrategy::AllowFallback(port)).unwrap();
+        assert_ne!(fallback, port);
     }
 
     #[test]
